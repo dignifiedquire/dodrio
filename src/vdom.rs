@@ -152,16 +152,16 @@ impl Vdom {
     /// rendering component.
     ///
     /// This will box the given component into trait object.
-    pub fn new<R>(container: &crate::Element, component: R) -> Vdom
+    pub async fn new<R>(container: &crate::Element, component: R) -> Vdom
     where
         R: RootRender,
     {
-        Self::with_boxed_root_render(container, Box::new(component) as Box<dyn RootRender>)
+        Self::with_boxed_root_render(container, Box::new(component) as Box<dyn RootRender>).await
     }
 
     /// Construct a `Vdom` with the already-boxed-as-a-trait-object root
     /// rendering component.
-    pub fn with_boxed_root_render(
+    pub async fn with_boxed_root_render(
         container: &crate::Element,
         component: Box<dyn RootRender>,
     ) -> Vdom {
@@ -201,7 +201,7 @@ impl Vdom {
             inner.change_list.init_events_trampoline(events_trampoline);
 
             // Diff and apply the `contents` against our dummy `<div/>`.
-            inner.render();
+            inner.render().await;
         }
 
         Vdom { inner }
@@ -256,7 +256,7 @@ impl VdomInnerExclusive {
     }
 
     /// Re-render this virtual dom's current component.
-    pub(crate) fn render(&mut self) {
+    pub(crate) async fn render(&mut self) {
         unsafe {
             let events_registry = self.events_registry.take().unwrap();
             {
@@ -267,9 +267,12 @@ impl VdomInnerExclusive {
                 dom_buffers[1].reset();
 
                 // Render the new current contents into the inactive bump arena.
-                let mut cx =
-                    RenderContext::new(&dom_buffers[1], &self.cached_set, &mut self.templates);
-                let new_contents = self.component.as_ref().unwrap_throw().render(&mut cx);
+                let cx = Rc::new(RefCell::new(RenderContext::new(
+                    &dom_buffers[1],
+                    &self.cached_set,
+                    &mut self.templates,
+                )));
+                let new_contents = self.component.as_ref().unwrap_throw().render(cx).await;
                 let new_contents = extend_node_lifetime(new_contents);
 
                 // Diff the old contents with the new contents.
@@ -321,27 +324,47 @@ impl VdomInnerExclusive {
     }
 }
 
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
+use std::pin::Pin;
+use std::task::{Context, Poll};
+struct Raf {
+    resolved: Rc<RefCell<bool>>,
+}
+
+impl Future for Raf {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        debug!("poll raf");
+        if *self.resolved.borrow() {
+            return Poll::Ready(());
+        }
+
+        Poll::Pending
+    }
+}
+
+fn request_animation_frame() -> Raf {
+    let resolved = Rc::new(RefCell::new(false));
+
+    let g = Rc::new(RefCell::new(None));
+    let h = g.clone();
+    let resolved1 = resolved.clone();
+    let f = Closure::wrap(Box::new(move || {
+        *g.borrow_mut() = None;
+        debug!("resolved frame");
+        *resolved1.borrow_mut() = true;
+    }) as Box<dyn FnMut()>);
+
     web_sys::window()
         .expect_throw("should have a window")
         .request_animation_frame(f.as_ref().unchecked_ref())
         .expect_throw("should register `requestAnimationFrame` OK");
-}
-
-fn with_animation_frame<F>(mut f: F)
-where
-    F: 'static + FnMut(),
-{
-    let g = Rc::new(RefCell::new(None));
-    let h = g.clone();
-
-    let f = Closure::wrap(Box::new(move || {
-        *g.borrow_mut() = None;
-        f();
-    }) as Box<dyn FnMut()>);
-    request_animation_frame(&f);
 
     *h.borrow_mut() = Some(f);
+
+    Raf {
+        resolved: resolved.clone(),
+    }
 }
 
 /// An operation failed because the virtual DOM was already dropped and
@@ -431,34 +454,35 @@ impl VdomWeak {
 
         async move {
             let inner = inner.ok_or(VdomDroppedError {})?;
+            let inner2 = Rc::downgrade(&inner);
 
-            let promise = inner.shared.render_scheduled.take().unwrap_or_else(|| {
-                js_sys::Promise::new(&mut |resolve, reject| {
-                    let vdom = VdomWeak {
-                        inner: Rc::downgrade(&inner),
-                    };
+            let promise = match inner.shared.render_scheduled.take() {
+                Some(promise) => promise,
+                None => wasm_bindgen_futures::future_to_promise(async move {
+                    let vdom = VdomWeak { inner: inner2 };
 
-                    with_animation_frame(move || match vdom.inner.upgrade() {
+                    debug!("request frame");
+                    request_animation_frame().await;
+                    debug!("got frame");
+                    match vdom.inner.upgrade() {
                         None => {
                             warn!("VdomWeak::render: vdom unmounted before we could render");
-                            let r = reject.call0(&JsValue::null());
-                            debug_assert!(r.is_ok());
+                            Err(JsValue::null())
                         }
                         Some(inner) => {
                             let mut exclusive = inner.exclusive.borrow_mut();
-                            exclusive.render();
+                            exclusive.render().await;
 
                             // We did the render, so take the promise away
                             // and let future `render` calls request new
                             // animation frames.
                             let _ = inner.shared.render_scheduled.take();
 
-                            let r = resolve.call0(&JsValue::null());
-                            debug_assert!(r.is_ok());
+                            Ok(JsValue::null())
                         }
-                    });
-                })
-            });
+                    }
+                }),
+            };
 
             inner.shared.render_scheduled.set(Some(promise.clone()));
 

@@ -1,5 +1,7 @@
 use crate::{Node, RenderContext};
+use async_trait::async_trait;
 use std::any::Any;
+use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::UnwrapThrowExt;
 
@@ -59,6 +61,28 @@ where
     }
 }
 
+/// A trait for any component that can be async rendered to HTML.
+///
+/// Takes a shared reference to `self` and generates the virtual DOM that
+/// represents its rendered HTML.
+#[async_trait(?Send)]
+pub trait AsyncRender<'a> {
+    /// Render `self` as a virtual DOM. Use the given context's `Bump` for
+    /// temporary allocations.
+    async fn render(&self, cx: Rc<RefCell<RenderContext<'a>>>) -> Node<'a>;
+}
+
+#[async_trait(?Send)]
+impl<'a, R: Render<'a>> AsyncRender<'a> for R {
+    async fn render(&self, cx: Rc<RefCell<RenderContext<'a>>>) -> Node<'a> {
+        let node = {
+            let mut cx = cx.borrow_mut();
+            Render::render(self, &mut *cx)
+        };
+        node
+    }
+}
+
 /// A `RootRender` is a render component that can be the root rendering component
 /// mounted to a virtual DOM.
 ///
@@ -69,7 +93,7 @@ where
 /// You do not need to implement this trait by hand: there is a blanket
 /// implementation for all `Render` types that fulfill the `RootRender`
 /// requirements.
-pub trait RootRender: Any + for<'a> Render<'a> {
+pub trait RootRender: Any + for<'a> AsyncRender<'a> {
     /// Get this `&RootRender` trait object as an `&Any` trait object reference.
     fn as_any(&self) -> &dyn Any;
 
@@ -80,7 +104,7 @@ pub trait RootRender: Any + for<'a> Render<'a> {
 
 impl<T> RootRender for T
 where
-    T: Any + for<'a> Render<'a>,
+    T: Any + for<'a> AsyncRender<'a>,
 {
     fn as_any(&self) -> &dyn Any {
         self
@@ -122,6 +146,32 @@ impl dyn RootRender {
         self.as_any_mut()
             .downcast_mut::<R>()
             .expect_throw("bad `RootRender::unwrap_ref` call")
+    }
+}
+
+use std::future::Future;
+use std::pin::Pin;
+
+#[async_trait(?Send)]
+impl<'a> AsyncRender<'a>
+    for RefCell<
+        genawaiter::rc::Gen<
+            Option<Node<'a>>,
+            Rc<RefCell<RenderContext<'a>>>,
+            Pin<Box<dyn Future<Output = ()> + 'static>>,
+        >,
+    >
+{
+    async fn render(&self, cx: Rc<RefCell<RenderContext<'a>>>) -> Node<'a> {
+        use genawaiter::GeneratorState;
+        let gen = &mut *self.borrow_mut();
+        // TODO: use async version
+        // https://github.com/whatisaphone/genawaiter/issues/21
+        match gen.resume_with(cx.clone()) {
+            GeneratorState::Yielded(Some(node)) => node,
+            GeneratorState::Yielded(None) => self.render(cx).await,
+            GeneratorState::Complete(_) => panic!("my watch has ended"),
+        }
     }
 }
 
